@@ -191,7 +191,7 @@ abstract class Nanodicom_Core {
 	
 	// Array of DICOM elements indexed by group and element index. The dataset
 	protected $_dataset = array();
-
+	
 	// Flag indicating if file has DICOM preamble or not. TRUE => DICM, FALSE => Anything else (NEMA?)
 	public $has_dicom_preamble = FALSE;
 	
@@ -263,6 +263,9 @@ abstract class Nanodicom_Core {
 
 	// Callback to check proper endian
 	protected $_check_proper_endian_function = '_check_proper_endian';
+	
+	// Number of retries to read oversized lenghts
+	protected $_oversize_retries = 0;
 
 	/**
 	 * Create a new Nanodicom instance. It is usually called from a class extended
@@ -574,6 +577,29 @@ abstract class Nanodicom_Core {
 	}
 
 	/**
+	 * Public method to delete a value using the group and element values
+	 *
+	 * @param   mixed    either the group as number or hex string
+	 * @param   mixed    either the element as number or hex string
+	 * @return  $this
+	 */
+	public function delete($group, $element)
+	{
+		$group   = is_string($group) ? hexdec($group) : $group;
+		$element = is_string($element) ? hexdec($element) : $element;
+
+		if (isset($this->_dataset[$group][$element]))
+		{
+			unset($this->_dataset[$group][$element]);
+		}
+		
+		// Update the group length if needed
+		$this->_update_group_length($this->_dataset, $group);
+		
+		return $this;
+	}
+
+	/**
 	 * Public static method to get the value from an array. If index does not exist, it returns the default.
 	 *
 	 * @param   array	the array to search
@@ -775,7 +801,7 @@ abstract class Nanodicom_Core {
 			
 			// Continue with the rest
 		}
-		
+
 		if ($new_value === NULL)
 		{
 			// TODO: Multiplicity values
@@ -787,6 +813,7 @@ abstract class Nanodicom_Core {
 					// Read value from blob
 					$this->_read_value_from_blob($dataset[$group][$element][0], $group, $element);
 				}
+
 				// It is a dataset, then return it, otherwise, just the value
 				return (count($dataset[$group][$element][0]['ds']) == 0) ? $dataset[$group][$element][0]['val'] 
 																		 : $dataset[$group][$element][0]['ds'];
@@ -795,16 +822,35 @@ abstract class Nanodicom_Core {
 			return FALSE;
 		}
 		
+		$original_vr = '';
+
 		// Rest of the code is for setting a value (creation or update)
-		
+		if (isset($dataset[$group][$element]))
+		{
+			// Update vr value
+			if ( ! isset($dataset[$group][$element][0]['done']))
+			{
+				// Read value from blob
+				$this->_read_value_from_blob($dataset[$group][$element][0], $group, $element);
+			}
+
+			// This is the vr read from file. Use it as a fallback
+			$original_vr = $dataset[$group][$element][0]['_vr'];
+		}
+
 		// Load the dictionary for this group
 		Nanodicom_Dictionary::load_dictionary($group, TRUE);
 
 		// Grab the vr
-		list($value_representation, $multiplicity, $name) = $this->_decode_vr($group, $element, '', 0);
-
-		//var_dump($value_representation, $group, $element, $new_value);
+		list($value_representation, $multiplicity, $name) = $this->_decode_vr($group, $element, $original_vr, 0);
 		
+		if (is_array($new_value))
+		{
+			// Extract vr and value from array
+			$value_representation = $new_value['vr'];
+			$new_value = $new_value['value'];
+		}
+
 		if (self::$vr_array[$value_representation][2] == 0)
 		{
 			// Finding right length
@@ -828,6 +874,7 @@ abstract class Nanodicom_Core {
 			$dataset[$group][$element][0]['done'] = TRUE;
 			$dataset[$group][$element][0]['val']  = $new_value;
 			$dataset[$group][$element][0]['len']  = $length;
+			$dataset[$group][$element][0]['vr']   = $value_representation;
 		}
 		else
 		{
@@ -956,6 +1003,9 @@ abstract class Nanodicom_Core {
 		// Iterate through the current elements
 		foreach ($this->_dataset as $group => $elements)
 		{	
+			// Sort the elements
+			ksort($elements);
+			
 			// Through groups
 			foreach ($elements as $element => $indexes)
 			{
@@ -1448,7 +1498,15 @@ abstract class Nanodicom_Core {
 			$_offset = $this->_tell();
 
 			// Add the pointer to corresponding length
-			$this->_forward($length);
+			$bytes_forwarded = $this->_forward($length);
+			
+			if ($bytes_forwarded != $length)
+			{
+				// Need to rewind
+				$this->_rewind(-1*$length);
+				$length = $bytes_forwarded;
+			}
+			
 			unset($endian, $vr_mode);
 			return array($group, $element, 
 				array('len'	  => $length,
@@ -1747,11 +1805,13 @@ abstract class Nanodicom_Core {
 		}
 		
 		$bytes = 4;
+		$vr_index = ($data['vr'] != $data['_vr'] AND ! empty($data['_vr'])) ? '_vr' : 'vr';
+		
 		if ($vr_mode == self::VR_MODE_EXPLICIT OR $group == self::METADATA_GROUP)
 		{
 			// For Explicit or Metadata Group
-			$buffer .= $data['vr'];
-			if (in_array($data['vr'], self::$vr_explicit_4bytes))
+			$buffer .= $data[$vr_index];
+			if (in_array($data[$vr_index], self::$vr_explicit_4bytes))
 			{
 				$buffer .= chr(0).chr(0);
 			}
@@ -1766,7 +1826,7 @@ abstract class Nanodicom_Core {
 		
 		// Setting the value
 		// TODO: Encode AT properly
-		switch ($data['vr'])
+		switch ($data[$vr_index])
 		{
 			// Decode Attribute Tag
 			case 'AT':
@@ -1810,7 +1870,7 @@ abstract class Nanodicom_Core {
 
 						// Setting the parent VR as OB, OW or OX, so Items know they should
 						// treat value as data not data sets
-						$this->_parent_vr = $data['vr'];
+						$this->_parent_vr = $data[$vr_index];
 
 						// Sort the keys
 						ksort($data['ds']);
@@ -1818,6 +1878,9 @@ abstract class Nanodicom_Core {
 						// Iterate through the current elements
 						foreach ($data['ds'] as $ds_group => $ds_elements)
 						{	
+							// Sort the elements
+							ksort($ds_elements);
+							
 							// Through groups
 							foreach ($ds_elements as $ds_element => $ds_indexes)
 							{
@@ -1852,7 +1915,7 @@ abstract class Nanodicom_Core {
 						// The Element has an undefined length. Let's get the rest from the items
 
 						// To let the Item know that value should be treated as Datas Sets
-						$this->_parent_vr = $data['vr'];
+						$this->_parent_vr = $data[$vr_index];
 
 						// Sort the keys
 						ksort($data['ds']);
@@ -1860,6 +1923,9 @@ abstract class Nanodicom_Core {
 						// Iterate through the current elements
 						foreach ($data['ds'] as $ds_group => $ds_elements)
 						{	
+							// Sort the elements
+							ksort($ds_elements);
+
 							// Through groups
 							foreach ($ds_elements as $ds_element => $ds_indexes)
 							{
@@ -1895,6 +1961,9 @@ abstract class Nanodicom_Core {
 							// Iterate through the current elements
 							foreach ($data['ds'] as $ds_group => $ds_elements)
 							{	
+								// Sort the elements
+								ksort($ds_elements);
+
 								// Through groups
 								foreach ($ds_elements as $ds_element => $ds_indexes)
 								{
@@ -2127,19 +2196,31 @@ abstract class Nanodicom_Core {
 	 */
 	protected function _forward($offset)
 	{
+		$increment = $offset;
 		$offset = $this->_current_pointer + $offset;
 
 		// Check if after forwarding with offset still within limits of DICOM object
 		if ($offset > $this->_file_length)
 		{
-			$missing_bytes = $offset - $this->_file_length;
-			throw new Nanodicom_Exception('End of file :file has been reached. File size is :filesize, failed to allocate :missing bytes at byte :byte'
-									  , array(':file' => $this->_location, ':filesize' => $this->_file_length, 
-											  ':missing' => $missing_bytes, ':byte' => sprintf('0x%04X',$this->_current_pointer)), 3);
+			if ($this->_oversize_retries > 0)
+			{
+				$missing_bytes = $offset - $this->_file_length;
+				throw new Nanodicom_Exception('End of file :file has been reached. File size is :filesize, failed to allocate :missing bytes at byte :byte'
+										  , array(':file' => $this->_location, ':filesize' => $this->_file_length, 
+												  ':missing' => $missing_bytes, ':byte' => sprintf('0x%04X',$this->_current_pointer)), 3);
+			}
+			else
+			{
+				// Blew up first time
+				$this->warnings[] = 'Retry file overflow while forwarding file pointer';
+				$this->_oversize_retries++;
+				$increment = 0;
+			}	
 		}
 	
 		// Otherwise is fine to add the offest to current_pointer
 		$this->_current_pointer = $offset;
+		return $increment;
 	}
 
 	/**
